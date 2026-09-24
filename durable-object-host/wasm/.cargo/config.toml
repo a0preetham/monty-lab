@@ -1,0 +1,5 @@
+# getrandom 0.3 refuses to build for wasm32-unknown-unknown unless a backend is
+# chosen via this cfg. "wasm_js" routes entropy to JS crypto.getRandomValues
+# (available in Cloudflare Workers) through wasm-bindgen.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

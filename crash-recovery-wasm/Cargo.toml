@@ -1,0 +1,29 @@
+[package]
+name = "crash-recovery-wasm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+
+# Deliberately NOT a workspace member.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+monty = "=0.0.23"
+monty-types = "=0.0.23"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+monty-alloc = "=0.0.23"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# NOTE: deliberately NOT panic="abort" — we want to observe what a Rust panic
+# does to a live wasm instance, which abort would mask.
+strip = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

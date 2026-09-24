@@ -1,0 +1,32 @@
+[package]
+name = "monty-session"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "A Monty REPL session exposed to JS as a step machine, so the host can drive tools asynchronously"
+
+# Deliberately NOT a workspace member.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+monty = "=0.0.23"
+monty-types = "=0.0.23"
+monty-alloc = "=0.0.23"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-pack's bundled wasm-opt rejects bulk-memory ops; see experiment E.
+wasm-opt = false

@@ -1,0 +1,16 @@
+name = "monty-agent-runtime"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+
+# Durable Objects with SQLite storage: 1 GB per object on the free plan,
+# 10 GB on paid. Snapshots here are measured in kilobytes.
+[[durable_objects.bindings]]
+name = "AGENT_RUN"
+class_name = "AgentRun"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentRun"]
+
+[build]
+command = ""

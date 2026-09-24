@@ -1,0 +1,12 @@
+{
+  "name": "durable-object-host",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "test": "node test-client.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.135.0"
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "agent-loop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Experiment C: an agent loop over MontyRepl, with a tool set that changes every turn"
+
+# Deliberately NOT a workspace member.
+[workspace]
+
+[dependencies]
+monty = "=0.0.23"
+monty-types = "=0.0.23"
+
+[lints.rust]
+unsafe_code = "forbid"

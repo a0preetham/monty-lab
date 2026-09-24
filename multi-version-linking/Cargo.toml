@@ -1,0 +1,32 @@
+[package]
+name = "multi-version-linking"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Experiment D: two monty versions in one binary, dispatched by dump header"
+
+# Deliberately NOT a workspace member.
+[workspace]
+
+# Every monty release is 0.0.x, and Cargo treats each 0.0.x patch as its own
+# semver-incompatible range — so these coexist with no tricks beyond renaming.
+[dependencies]
+monty_v22 = { package = "monty", version = "=0.0.22" }
+monty_v23 = { package = "monty", version = "=0.0.23" }
+monty_types_v22 = { package = "monty-types", version = "=0.0.22" }
+monty_types_v23 = { package = "monty-types", version = "=0.0.23" }
+
+[[bin]]
+name = "dispatcher"
+path = "src/main.rs"
+
+[[bin]]
+name = "only_v23"
+path = "src/bin/only_v23.rs"
+
+[profile.release]
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"

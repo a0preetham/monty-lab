@@ -1,0 +1,17 @@
+[package]
+name = "repl-session-persistence"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Experiment A: probing monty 0.0.23's MontyRepl for agent-runtime session semantics"
+
+# Deliberately NOT a workspace member.
+[workspace]
+
+[dependencies]
+monty = "=0.0.23"
+monty-types = "=0.0.23"
+
+[lints.rust]
+unsafe_code = "forbid"
