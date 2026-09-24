@@ -34,10 +34,11 @@ One new blocker was found and fixed: **without `monty-alloc` installed as the
 global allocator, a single over-allocating guest snippet permanently kills the
 wasm instance.**
 
-Two costs are worth budgeting for, neither of them in the handoff: **snapshots
-grow about 48 bytes per turn regardless of state** (H), and the **1.0
-interpreter costs ~6 MiB linked rather than ~4 MiB**, cutting the bundle ceiling
-to roughly 10 versions (D).
+Three costs are worth budgeting for, none of them in the handoff: **snapshots
+grow about 48 bytes per turn regardless of state** (H), the **1.0 interpreter
+costs ~6 MiB linked rather than ~4 MiB**, cutting the bundle ceiling to roughly
+10 versions (D), and **session creation costs 23–25 ms CPU against 1–5 ms for
+every other kind of turn** (F), which is what rules out the free plan.
 
 `durable-object-host/` runs the whole thing end to end — real Monty in wasm,
 inside a real Durable Object under local workerd, with a run parked mid-tool-call
@@ -54,5 +55,9 @@ Node 22, local workerd via wrangler 4.135, and two Rust toolchains:
 
 Versions under test: `monty` 0.0.22, 0.0.23 and 1.0.0-beta.2.
 
-**No Cloudflare credentials at the time of the original run** — see the "Still
-open" section of `FINDINGS.md` for what that left unverified.
+Experiment F has been **deployed to real Cloudflare and measured there** (paid
+plan, 2026-09-24, 23/23 passing), then deleted — see
+[`durable-object-host/NOTES.md`](durable-object-host/NOTES.md#deployed-to-real-cloudflare).
+Hibernation, cold-wake cost, the frozen clocks and the CPU ceiling are all
+measured rather than deduced. See the "Still open" section of `FINDINGS.md` for
+what remains.

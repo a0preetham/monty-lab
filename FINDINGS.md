@@ -2,8 +2,10 @@
 
 Nine workstreams: A–G from the handoff, plus H and I, added to close two of its
 untested caveats. Run against `monty` 0.0.22, 0.0.23 and 1.0.0-beta.2 on Rust
-1.95.0 and 1.96.0. Every claim traces to output from code in this repo;
-per-experiment reproduction steps are in each `NOTES.md`.
+1.95.0 and 1.96.0. **F has since been deployed to real Cloudflare and measured
+there**, which closed the largest remaining gap. Every claim traces to output
+from code in this repo; per-experiment reproduction steps are in each
+`NOTES.md`.
 
 ## Verdict
 
@@ -25,6 +27,8 @@ one.
 | #895: `u16` name-id exhaustion after ~65k feeds | **Not reachable** from the Rust API — 300,000 feeds, clean, on both lines. But it has a cousin: see [H](#h-the-turn-ceiling-that-isnt--name-id-exhaustion). |
 | "Keep host objects out of long-lived guest state" | **Too strong.** The handle survives the dump and the host can rebind it by id; see [I](#i-host-objects-across-a-dump--host-objects-across-dump). |
 | "this experiment could not exercise a genuine cross-format route" (D, first run) | **Now exercised.** 1.0.0-beta.2 carries dump format 12 against 0.0.x's 8. |
+| `performance.now()` frozen under Workers, so `max_duration` cannot fire (E, deduced) | **Measured, and understated.** `Date.now()` is frozen too, so the *host* cannot time its own turns either. |
+| "Free-plan CPU time: 10 ms vs 5 min paid" | **Quantified.** Session creation costs 23–25 ms CPU, so the free plan cannot start a run; warm turns (1–5 ms) would fit. |
 | Crash isolation without the pool — open question | **Answered, and it matters:** see [the one thing you must do](#the-one-thing-you-must-do). |
 
 ### The one thing you must do
@@ -142,8 +146,20 @@ network.
 **`performance.now()` is frozen in Workers** (Spectre mitigation), and Monty's
 `max_duration` is backed by it — so guest wall-clock limits will not advance
 under Workers. Rely on memory and recursion limits, and on Cloudflare's own CPU
-limit. Deduced from the import list plus documented Workers behaviour; not tested
-against real Workers.
+limit.
+
+**This was deduced here and has since been measured on real Workers (F).** Three
+clocks read either side of 20,000,000 iterations of real CPU work — JS
+`performance.now()`, JS `Date.now()`, and Monty's own `web_time::Instant`, read
+from inside the module — all returned a delta of **0**, where local workerd gave
++47 ms for each. With `max_duration` armed at 50 ms, a 3,000,000-iteration guest
+loop ran to completion and no timeout fired. The clocks advance *between*
+requests (0, 117, 230 ms), so time moves on I/O and never during compute.
+
+The deduction was also understated: `Date.now()` being frozen means **the host
+cannot measure its own turn duration**, so per-turn timing and CPU accounting
+must come from `wrangler tail` or Workers Analytics rather than from a clock
+around the work.
 
 ## F. Durable Object session host — `durable-object-host/`
 
@@ -158,6 +174,24 @@ into the suspension. That is "parked on an approval for weeks" working.
 
 The interpreter is exposed to JS as a step machine so the suspension loop lives in
 JS and tools can be genuinely async — no JSPI required.
+
+**Now also deployed to real Cloudflare (2026-09-24), and 23/23 pass there too.**
+The worker was deleted after measuring. What the deploy settled:
+
+- **Hibernation is real.** Left idle 150 s with no requests, the next turn came
+  back `loadedFrom: "snapshot"` — Cloudflare discarded the session on its own and
+  the run continued from SQLite. `evict` was a faithful simulation.
+- **The ~4 MB module is not a startup problem.** 4,494 KiB uncompressed
+  (1,688 KiB gzip), and Cloudflare reported **2 ms Worker Startup Time**.
+- **Cost per request** (from `wrangler tail`, since the worker cannot time
+  itself): router 0–1 ms CPU, first turn on a new object **23–25 ms**, wake from
+  snapshot **2–5 ms**, warm turn ~1 ms. Client-side wall latency ranged 113 ms
+  warm to 544 ms for a cold create, network included.
+- **Every clock is frozen inside a request**, `Date.now()` included — see below.
+- **The CPU ceiling is Cloudflare's**, at `exceededCpu` after 32,500 ms:
+  `Durable Object exceeded its CPU time limit and was reset`. **The object
+  survives it** — the next request woke from the snapshot with prior state
+  intact. A runaway turn costs the turn, not the run.
 
 Gotchas found: use `--target web` (not `bundler`) so Workers' `WebAssembly.Module`
 import works; and use `serde_wasm_bindgen`'s `json_compatible()` serializer, or
@@ -255,8 +289,10 @@ defined`, which points at the method and reads like a missing function. Return
 1. **Drop the #190 workaround from scope.** Per-turn tool sets work natively.
 2. **`monty-alloc` is mandatory, not optional.** It is the difference between a
    recoverable turn error and a dead isolate.
-3. **Don't rely on Monty's wall-clock limit under Workers.** Budget against
-   Cloudflare's CPU limit; use memory and recursion limits for the guest.
+3. **Don't rely on Monty's wall-clock limit under Workers** — measured inert.
+   Budget against Cloudflare's ~30 s CPU limit; use memory and recursion limits
+   for the guest. Take per-turn timing from outside the request, because
+   `Date.now()` inside it does not move.
 4. **Snapshot cadence sets the blast radius** of a guest OOM, since recovery means
    discarding the instance and reloading the last snapshot.
 5. **Version routing is cheaper than feared, but not free.** Shared dump formats
@@ -273,14 +309,22 @@ defined`, which points at the method and reads like a missing function. Return
    Object, a row in its own SQLite. Ids must be stable, never regenerated on
    wake. Put anything that must survive a cold wake unattended into the eager
    attrs, where it lands in the dump.
+9. **Session creation is the expensive turn** (23–25 ms CPU against 1–5 ms for
+   everything else), which is what rules out the free plan and what a warm-start
+   strategy would target.
+10. **A CPU-limit reset is survivable and looks like hibernation.** Both a guest
+    OOM and a runaway turn land the run back on its last snapshot, so the same
+    recovery path covers both.
 
 ## Still open
 
-- **No deploy.** Real hibernation, cold-start latency with a ~4 MB module, and
-  paid-plan CPU limits are unverified. This environment has no Cloudflare
-  credentials, so everything is local workerd.
-- **The frozen-timer caveat is deduced, not measured** against real Workers.
 - **No real model in the loop** (C) — no API credentials.
+- **The free plan was not run on.** The deploy was on a paid plan; the free-tier
+  conclusion is measured CPU cost against the documented 10 ms limit, not an
+  attempt to run there.
+- **Nothing was parked for days.** Hibernation is confirmed at 150 s idle; weeks
+  is still an extrapolation, and the eviction threshold below 150 s was not
+  bracketed.
 - **JSPI on Workers** remains unverified, though the step-machine design avoids
   needing it.
 - **The 1.0 line is not wasm-measured.** D's ~6 MiB figure is native; E found

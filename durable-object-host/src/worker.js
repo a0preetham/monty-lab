@@ -92,12 +92,20 @@ export class AgentRun {
 
   /** Warm if possible, otherwise rehydrate from this object's own storage. */
   async ensureSession() {
+    // Deploy-measurement instrumentation: separates the three costs that make
+    // up a cold wake (wasm init, snapshot read, Dump::load) so the numbers can
+    // be attributed rather than lumped into one latency figure.
+    this.timings = {};
+    const tWasm = Date.now();
     await this.ensureWasm();
+    this.timings.wasmInitMs = Date.now() - tWasm;
     if (this.session) {
       this.loadedFrom = 'memory';
       return this.session;
     }
+    const tRead = Date.now();
     const rows = [...this.sql.exec('SELECT bytes, dump_version FROM snapshot WHERE id = 1')];
+    this.timings.sqlReadMs = Date.now() - tRead;
     if (rows.length) {
       const stored = rows[0].dump_version;
       const mine = AgentSession.dumpVersion();
@@ -106,7 +114,10 @@ export class AgentRun {
         // the interpreter that can read `stored` instead of failing.
         throw new Error(`snapshot is dump v${stored}, this build reads v${mine}`);
       }
+      const tLoad = Date.now();
       this.session = AgentSession.restore(new Uint8Array(rows[0].bytes), undefined);
+      this.timings.restoreMs = Date.now() - tLoad;
+      this.timings.snapshotBytes = rows[0].bytes.byteLength ?? rows[0].bytes.length;
       this.loadedFrom = 'snapshot';
       this.log('woke from snapshot');
     } else {
@@ -132,7 +143,10 @@ export class AgentRun {
   /** Run one turn: feed a snippet, service tool calls, persist. */
   async runTurn(code) {
     const session = await this.ensureSession();
-    return this.drive(session, session.start(code), []);
+    const tFeed = Date.now();
+    const first = session.start(code);
+    this.timings.firstStepMs = Date.now() - tFeed;
+    return this.drive(session, first, []);
   }
 
   /** Answer a parked tool call and carry on from where the run suspended. */
@@ -184,7 +198,9 @@ export class AgentRun {
     }
 
     this.turnCount = (this.turnCount ?? 0) + 1;
+    const tPersist = Date.now();
     const snapshotBytes = this.persist();
+    if (this.timings) this.timings.persistMs = Date.now() - tPersist;
     this.log(`turn ${this.turnCount}: ${step.kind}`);
 
     return {
@@ -194,6 +210,7 @@ export class AgentRun {
       snapshotBytes,
       suspended: session.suspended,
       turns: this.turnCount,
+      timings: this.timings,
     };
   }
 
@@ -222,6 +239,83 @@ export class AgentRun {
     this.log('evicted (in-memory state discarded)');
   }
 
+
+  // -------------------------------------------------------------------------
+  // Deploy-measurement probes. These exist to answer questions that local
+  // workerd cannot: what the clocks do under real Workers, and where the real
+  // CPU ceiling is. They are not part of the runtime design.
+  // -------------------------------------------------------------------------
+
+  /** Burn real CPU, reading every clock either side of it. */
+  async timerProbe() {
+    // The module-level wasm binding is per-isolate, so a probe that reads the
+    // interpreter's clock has to initialise it first rather than relying on an
+    // earlier request in the same isolate having done so.
+    await this.ensureWasm();
+    const jsPerf0 = performance.now();
+    const jsDate0 = Date.now();
+    const monty0 = AgentSession.clockNowMs();
+
+    // Real work, not a sleep: sleeping would not distinguish a frozen clock
+    // from an idle one.
+    let acc = 0;
+    for (let i = 0; i < 20_000_000; i++) acc += i % 7;
+
+    const jsPerf1 = performance.now();
+    const jsDate1 = Date.now();
+    const monty1 = AgentSession.clockNowMs();
+
+    return {
+      burnResult: acc,
+      jsPerformanceNow: { before: jsPerf0, after: jsPerf1, delta: jsPerf1 - jsPerf0 },
+      jsDateNow: { before: jsDate0, after: jsDate1, delta: jsDate1 - jsDate0 },
+      // The clock Monty's own max_duration is backed by, read inside the module.
+      montyClockMs: { before: monty0, after: monty1, delta: monty1 - monty0 },
+    };
+  }
+
+  /**
+   * Arm Monty's own wall-clock limit and then exceed it in guest code.
+   *
+   * Experiment E predicted this limit cannot fire on Workers. If the prediction
+   * holds, the guest loop runs to completion (or dies on Cloudflare's CPU limit)
+   * and no interpreter-level timeout is ever raised.
+   */
+  async durationProbe(maxDurationMs, iterations) {
+    await this.ensureWasm();
+    const probe = new AgentSession('duration-probe.py', undefined, maxDurationMs);
+    const started = Date.now();
+    let step;
+    let error = null;
+    try {
+      step = probe.start(`total = 0\nfor i in range(${iterations}):\n    total += i % 7\ntotal\n`);
+    } catch (e) {
+      error = String(e.message ?? e);
+    }
+    return {
+      maxDurationMs,
+      iterations,
+      wallMs: Date.now() - started,
+      step: step ?? null,
+      error,
+      // The question this probe exists for.
+      montyTimeoutFired: /timeout|duration|time limit/i.test(error ?? JSON.stringify(step ?? {})),
+    };
+  }
+
+  /** Guest CPU work of a given size — finds the effective per-request ceiling. */
+  async cpuBurn(iterations) {
+    await this.ensureWasm();
+    const probe = new AgentSession('cpu-burn.py', undefined, undefined);
+    const started = Date.now();
+    try {
+      const step = probe.start(`total = 0\nfor i in range(${iterations}):\n    total += i % 7\ntotal\n`);
+      return { iterations, wallMs: Date.now() - started, step };
+    } catch (e) {
+      return { iterations, wallMs: Date.now() - started, error: String(e.message ?? e) };
+    }
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
     const action = url.pathname.split('/').filter(Boolean).pop();
@@ -245,6 +339,18 @@ export class AgentRun {
         case 'evict': {
           this.evict();
           return json({ evicted: true });
+        }
+        case 'timer-probe': {
+          return json(await this.timerProbe());
+        }
+        case 'duration-probe': {
+          const ms = Number(url.searchParams.get('ms') ?? 50);
+          const iterations = Number(url.searchParams.get('n') ?? 3_000_000);
+          return json(await this.durationProbe(ms, iterations));
+        }
+        case 'cpu-burn': {
+          const iterations = Number(url.searchParams.get('n') ?? 1_000_000);
+          return json(await this.cpuBurn(iterations));
         }
         case 'status': {
           const rows = [...this.sql.exec('SELECT dump_version, turns, updated_at, length(bytes) AS n FROM snapshot WHERE id = 1')];

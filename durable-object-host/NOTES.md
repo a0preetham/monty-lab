@@ -13,8 +13,9 @@ npx wrangler dev --local --port 8799     # terminal 1
 node test-client.mjs                     # terminal 2
 ```
 
-No Cloudflare credentials are needed or used — everything runs against local
-workerd. Nothing here has been deployed.
+Local workerd needs no Cloudflare credentials. It has since also been
+**deployed to real Cloudflare** and measured there — see
+[Deployed to real Cloudflare](#deployed-to-real-cloudflare).
 
 ## Architecture
 
@@ -93,15 +94,146 @@ snapshot row, and `ensureSession` compares it on wake. Today a mismatch throws;
 that throw is exactly where a multi-version build (experiment D) would dispatch to
 the interpreter that can read those bytes.
 
+
+## Deployed to real Cloudflare
+
+Deployed 2026-09-24 as `monty-agent-runtime` on the Workers paid plan, and
+**23/23 checks pass against real Cloudflare**, not just workerd:
+`BASE=https://<worker>.workers.dev node test-client.mjs`. The worker was deleted
+after these measurements were taken; nothing is left running.
+
+Bundle as uploaded: **4,494.43 KiB uncompressed, 1,687.66 KiB gzipped** — against
+the 64 MiB uncompressed limit, and Cloudflare reported **2 ms Worker Startup
+Time** for it. The ~4 MB module the handoff worried about is not a startup
+problem.
+
+### Real hibernation happens, and the cold path is the one that runs
+
+The handoff's central claim is that an idle object hibernates and wakes from its
+own storage. `evict` only simulated that. Left genuinely idle for **150 seconds**
+with no requests, the next turn reported `loadedFrom: "snapshot"` — Cloudflare
+discarded the in-memory session on its own, and the run continued from SQLite
+with state intact.
+
+Client-side latency, from a machine several hops from the edge (so these include
+network RTT, not just Cloudflare time):
+
+| Request | `loadedFrom` | Wall |
+| --- | --- | --- |
+| first turn on a brand-new object | `new` | 544 ms |
+| warm turn | `memory` | 113 ms |
+| warm turn | `memory` | 179 ms |
+| turn after a forced `evict` | `snapshot` | 139 ms |
+| **turn after 150 s idle** | **`snapshot`** | **192 ms** |
+| first turn on a second new object, isolate warm | `new` | 353 ms |
+
+### CPU cost per request, read from `wrangler tail`
+
+Server-side timing had to come from `wrangler tail`, because the worker cannot
+measure itself — see the frozen clocks below.
+
+| What | Execution model | CPU |
+| --- | --- | --- |
+| Router (`/run/:id/:action` → `idFromName`) | `stateless` | 0–1 ms |
+| First turn on a new object (wasm init + session create + feed + persist) | `durableObject` | **23–25 ms** |
+| Turn that woke from a snapshot | `durableObject` | **2–5 ms** |
+| Warm turn | `durableObject` | ~1 ms |
+
+**This settles the free-plan question.** The free tier allows 10 ms CPU per
+invocation, and **creating a session costs 23–25 ms** — so the free plan cannot
+start a run at all, though warm turns and snapshot wakes (1–5 ms) would fit
+inside it. "Free tier is prototyping only" is right, and now it has a number and
+a reason: it is session creation, not steady-state work, that does not fit.
+
+The router costing ~0–1 ms confirms the design choice of keeping it stateless:
+routing is free, and the interpreter never crosses a worker boundary.
+
+### Every clock is frozen inside a request — measured, not deduced
+
+Experiment E deduced from the wasm import list that `performance.now()` is frozen
+on Workers and that Monty's `max_duration`, backed by it, therefore cannot fire.
+The `timer-probe` action measures it directly: three clocks read either side of
+20,000,000 iterations of real CPU work.
+
+| Clock | Local workerd | Real Workers |
+| --- | --- | --- |
+| `performance.now()` | +47 ms | **0** |
+| `Date.now()` | +47 ms | **0** |
+| Monty's own `web_time::Instant` | +47 ms | **0** |
+
+All three are frozen, `Date.now()` included — the prediction was right and
+understated. The clocks *do* advance between requests (successive probes read
+0 ms, 117 ms, 230 ms), which is the documented Spectre mitigation: time moves on
+I/O, never during compute.
+
+The consequence, confirmed by `duration-probe`: with `max_duration` armed at
+**50 ms**, a 3,000,000-iteration guest loop **ran to completion** with no timeout.
+Monty's wall-clock limit is inert on Workers. Rely on `max_memory` and
+`max_recursion_depth`, as this host already does.
+
+A second consequence the handoff does not mention: **the host cannot time its own
+turns either.** Every in-worker duration the instrumentation collects reads 0 ms.
+Per-turn latency and CPU accounting have to come from `wrangler tail`, Workers
+Analytics, or a clock outside the request — not from `Date.now()` around the
+work.
+
+### The real CPU ceiling, and what it costs
+
+Ramping guest work to find the wall:
+
+| Guest iterations | Outcome |
+| --- | --- |
+| 1M – 100M | completes (100M took 18.4 s wall) |
+| 300M+ | fails |
+
+At the wall, `wrangler tail` reports `outcome: exceededCpu` at **32,500 ms CPU**
+with `Error: Durable Object exceeded its CPU time limit and was reset.` So the
+enforcing limit is Cloudflare's ~30 s per-invocation CPU budget, not anything in
+Monty — consistent with the frozen-clock result, since Monty's own limit can
+never fire.
+
+**The object survives it.** After the reset, the next request to the same run id
+returned `loadedFrom: "snapshot"` with pre-existing guest state (`survivor`)
+intact, and the event log shows a clean `woke from snapshot`. A runaway turn
+costs the turn, not the run — the same shape as the guest-OOM result in G, and
+direct confirmation that snapshot cadence is what bounds the blast radius.
+
+### Reproducing these numbers
+
+```bash
+npx wrangler deploy
+BASE=https://<worker>.workers.dev node test-client.mjs      # the 23 checks
+BASE=https://<worker>.workers.dev ./deploy-measure.sh       # latency + hibernation
+npx wrangler tail --format json                             # server-side CPU
+npx wrangler delete                                         # when done
+```
+
+`deploy-measure.sh` step 5 waits out a real idle period rather than calling
+`evict`, which is what makes the hibernation result meaningful.
+
+### Probes added for these measurements
+
+`timer-probe`, `duration-probe` and `cpu-burn` actions, plus a `max_duration_ms`
+argument on the `AgentSession` constructor and an `AgentSession.clockNowMs()`
+static that reads the interpreter's own clock. They exist to answer questions
+local workerd cannot and are not part of the runtime design — `max_duration` in
+particular should stay `undefined` in production, since it cannot work here.
+
+One trap worth recording: `clockNowMs()` is static, so calling it before any
+request has initialised the module throws
+`Cannot read properties of undefined`. It passed locally only because an earlier
+request had already initialised wasm **in the same isolate**. Any static export
+on a wasm-bindgen class needs `await initWasm(...)` first, per isolate.
+
 ## Not covered
 
-- **No deploy.** Real hibernation, cold-start latency with a ~4 MB wasm module,
-  and the paid-plan CPU limits are all unverified; `evict` simulates eviction by
-  dropping in-memory state, which is faithful to the documented model but is not
-  the real thing.
-- **`performance.now()` is frozen on Workers** (experiment E). Monty's
-  `max_duration` is backed by it, so guest wall-clock limits will not advance.
-  This host therefore relies on `max_memory` and `max_recursion_depth`, not time.
-  Untested against real Workers.
 - **Snapshot-per-turn is unconditional here.** A production host would weigh
   snapshot cost against how much work a guest OOM may discard (experiment G).
+- **Free plan untested directly.** The deploy was on a paid plan; the free-tier
+  conclusion above is drawn from measured CPU cost against the documented 10 ms
+  limit, not from an attempt to run there.
+- **Idle hibernation was observed at 150 s, not bracketed.** The eviction
+  threshold below that was not searched for, and Cloudflare does not commit to
+  one.
+- **Nothing was parked for days.** The longest real gap tested is 150 s; "parked
+  on an approval for weeks" is still an extrapolation from it.

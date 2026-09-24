@@ -73,20 +73,47 @@ pub struct AgentSession {
 #[wasm_bindgen]
 impl AgentSession {
     /// A brand-new run.
+    ///
+    /// `max_duration_ms` arms Monty's own wall-clock limit. Experiment E
+    /// predicted from the wasm import list that this cannot work on Workers,
+    /// because Monty backs it with `web_time::Instant` — i.e. with
+    /// `performance.now()`, which Workers freezes as a Spectre mitigation. It is
+    /// exposed here so the prediction can be measured against real Workers
+    /// instead of deduced; leave it `undefined` in production.
     #[wasm_bindgen(constructor)]
-    pub fn new(script_name: &str, max_memory: Option<usize>) -> Result<AgentSession, JsValue> {
+    pub fn new(
+        script_name: &str,
+        max_memory: Option<usize>,
+        max_duration_ms: Option<u32>,
+    ) -> Result<AgentSession, JsValue> {
         let limit = max_memory.unwrap_or(DEFAULT_MAX_MEMORY);
         // Arm the allocator. Failure here is not fatal — it means the memory
         // ceiling is unenforced, which the host may want to know about.
         let _ = monty_alloc::set_limit(Some(limit), false);
+        let mut limits = ResourceLimits::default().max_memory(limit);
+        if let Some(ms) = max_duration_ms {
+            limits = limits.max_duration(std::time::Duration::from_millis(u64::from(ms)));
+        }
         Ok(Self {
             state: State::Idle(Box::new(MontyRepl::new(
                 script_name,
-                ResourceTracker::new(ResourceLimits::default().max_memory(limit)),
+                ResourceTracker::new(limits),
                 CompileOptions::default(),
             ))),
             script: script_name.to_owned(),
         })
+    }
+
+    /// What the interpreter's own clock reads, in milliseconds since the wasm
+    /// instance started. This is the same `web_time::Instant` source that backs
+    /// `max_duration`, read from inside the module — so if Workers freezes it,
+    /// two reads either side of real CPU work return the same number.
+    #[wasm_bindgen(js_name = clockNowMs)]
+    pub fn clock_now_ms() -> f64 {
+        use std::sync::OnceLock;
+        static ORIGIN: OnceLock<web_time::Instant> = OnceLock::new();
+        let origin = ORIGIN.get_or_init(web_time::Instant::now);
+        origin.elapsed().as_secs_f64() * 1000.0
     }
 
     /// Rehydrate from a snapshot — the cold path after hibernation.
