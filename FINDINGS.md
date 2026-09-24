@@ -1,15 +1,20 @@
 # Findings
 
-All seven workstreams (A–G) from the handoff, run against `monty 0.0.23`
-(published 2026-09-20) on Rust 1.95.0. Every claim traces to output from code in
-this repo; per-experiment reproduction steps are in each `NOTES.md`.
+Nine workstreams: A–G from the handoff, plus H and I, added to close two of its
+untested caveats. Run against `monty` 0.0.22, 0.0.23 and 1.0.0-beta.2 on Rust
+1.95.0 and 1.96.0. Every claim traces to output from code in this repo;
+per-experiment reproduction steps are in each `NOTES.md`.
 
 ## Verdict
 
 **The design holds.** Every load-bearing assumption was tested and none failed.
-Three of the handoff's stated blockers turned out not to apply at all, one new
-blocker appeared and has a fix, and the whole thing now runs end to end inside a
-Durable Object.
+Four of the handoff's stated blockers turned out not to apply at all, one of its
+prohibitions turned out to be avoidable, one new blocker appeared and has a fix,
+and the whole thing now runs end to end inside a Durable Object.
+
+What the handoff does not account for is cost rather than correctness: snapshots
+grow with turn count, and the 1.0 interpreter is half again as large as a 0.0.x
+one.
 
 | Handoff claim | Reality on 0.0.23 |
 | --- | --- |
@@ -17,6 +22,9 @@ Durable Object.
 | "Classes not yet definable inside Monty" | **Outdated.** Classes, methods, `isinstance`, `@dataclass` all work and survive snapshots. |
 | #872: `type_check` desyncs the namespace | **Unreachable.** There is no `type_check` knob on the Rust API. The open decision does not arise. |
 | Wasm viability unknown — "invalidates the whole hosting plan if it fails" | **Passes.** Compiles, runs, and hosts a Durable Object session. |
+| #895: `u16` name-id exhaustion after ~65k feeds | **Not reachable** from the Rust API — 300,000 feeds, clean, on both lines. But it has a cousin: see [H](#h-the-turn-ceiling-that-isnt--name-id-exhaustion). |
+| "Keep host objects out of long-lived guest state" | **Too strong.** The handle survives the dump and the host can rebind it by id; see [I](#i-host-objects-across-a-dump--host-objects-across-dump). |
+| "this experiment could not exercise a genuine cross-format route" (D, first run) | **Now exercised.** 1.0.0-beta.2 carries dump format 12 against 0.0.x's 8. |
 | Crash isolation without the pool — open question | **Answered, and it matters:** see [the one thing you must do](#the-one-thing-you-must-do). |
 
 ### The one thing you must do
@@ -78,18 +86,48 @@ everything beneath it is real.
 
 ## D. Multi-version linking — `multi-version-linking/`
 
-Two versions in one binary needs only renamed dependencies, because every Monty
-release is `0.0.x` and Cargo treats each patch as semver-incompatible. Cross-
-version confusion is a compile error.
+Several versions in one binary needs only renamed dependencies, because Cargo
+treats each `0.0.x` patch — and `1.0.0-beta.2` — as its own semver-incompatible
+range. Cross-version confusion is a compile error. Three are linked here: 0.0.22,
+0.0.23 and 1.0.0-beta.2.
 
-**Marginal cost per interpreter: 4.05 MiB** (native), matching the 3.87 MiB wasm
-figure — roughly 14–16 versions within Cloudflare's 64 MiB limit.
+**The cross-format route is now exercised for real.** The first run of this
+experiment could only synthesise a foreign snapshot by rewriting a header, since
+both published versions carried dump format 8. `monty 1.0.0-beta.2` (published
+2026-09-21) carries format **12**, so each interpreter can be handed the other's
+actual bytes. Both refuse, and not identically:
 
-**Dump version is not crate version, confirmed:** 0.0.22 and 0.0.23 both report
-`DUMP_VERSION = 8`, and a 0.0.22 snapshot loaded fine on 0.0.23. Good news
-(snapshots strand far less often than per-release), with a catch (the routing
-table maps dump versions, maintained by hand). Because both published versions
-share format 8, a genuine cross-format route could not be exercised.
+```
+1.0.0-beta.2 reading a v8 dump  -> VersionTooOld { found: 8, min_supported: 12 }
+0.0.23 reading a v12 dump       -> VersionMismatch { found: 12, expected: 8 }
+```
+
+`min_supported: 12` is the load-bearing detail: **1.0 did not merely stop writing
+format 8, it stopped reading it.** There is no compatibility window to lean on —
+a deploy from 0.0.23 to 1.0 without a router meets `VersionTooOld` on every
+parked run. With the router, all three snapshots resume on the version that wrote
+them and keep executing.
+
+**Costs, measured with like-for-like binaries:** a 0.0.x interpreter adds
+**3.82 MiB** (consistent with the 4.05 MiB measured on rustc 1.95), but the 1.0
+interpreter adds **5.96 MiB — 56% more**. That revises the bundle budget from
+14–16 versions down to **roughly 10** within Cloudflare's 64 MiB limit. Still
+above the "ten-plus" the handoff wanted, but the margin is gone.
+
+**The MSRV couples every linked version.** `monty 1.0.0-beta.2` requires rustc
+1.96 where 0.0.23 required exactly 1.95, and because all linked versions share
+one crate graph the whole bundle builds on the newest one's toolchain. It worked
+here — 0.0.22 and 0.0.23 both build clean on 1.96.0 — but adopting a new Monty
+forces its MSRV onto every old interpreter being kept for parked runs. A future
+release whose MSRV exceeds what an old version can compile under would make them
+unlinkable, and the only way out would be the drain window this design exists to
+avoid.
+
+**Dump version is not crate version, confirmed both ways:** 0.0.22 and 0.0.23
+both report `DUMP_VERSION = 8` and interoperate; 1.0.0-beta.2 reports 12. So
+snapshots strand far less often than per-release — but the routing table is keyed
+by dump version, with duplicate keys collapsed, and maintained by hand. Where
+several linked versions read a format, route to the newest of them.
 
 ## E. Wasm target viability — `wasm-target-viability/`
 
@@ -143,6 +181,73 @@ a linked library; `set_limit` reports "not installed" if nothing has allocated
 yet; and `monty-alloc`'s *hard* limit calls `process::exit`, so the soft limit
 must fire first.
 
+## H. The turn ceiling that isn't — `name-id-exhaustion/`
+
+monty [#895](https://github.com/pydantic/monty/issues/895) — every `feed_run`
+interns a script name into a `u16` space, so "long-lived sessions with many turns
+will hit this" — **is not reachable from the Rust API**. 300,000 feeds, 4.5x the
+theoretical 65,535 ceiling, no failure, on both 0.0.23 and 1.0.0-beta.2. Not a
+caught error or a slow degradation: nothing happens. The turn ceiling can come
+off the risk list.
+
+Pushing the feed count turned up the real cost, which the handoff does not
+mention. With guest state held constant at one small dict:
+
+| feeds | dump bytes | bytes/feed | dump ms | load ms |
+| --- | --- | --- | --- | --- |
+| 100 | 4,338 | 43.4 | 0.0 | 0.1 |
+| 1,000 | 43,943 | 43.9 | 0.1 | 0.3 |
+| 10,000 | 457,945 | 45.8 | 0.4 | 2.1 |
+| 100,000 | 4,777,951 | 47.8 | 10.7 | 29.8 |
+
+**About 48 bytes of permanent snapshot per turn, linear and unbounded**, on both
+versions, identically. Experiment B's ~6.9 KB headline measures *state*; this is
+the other axis, and for a long run it dominates. A 100,000-turn run carries a
+4.8 MB snapshot containing, as far as the guest is concerned, nothing — and pays
+~11 ms to dump and ~30 ms to load it on **every** hibernation and **every** cold
+wake.
+
+**A reload does not compact it.** 40,000 feeds dumped to 1,897,953 bytes;
+reloading and feeding 40,000 more gave 3,818,006 — exactly 2.01x. The
+accumulation is in the dump, so loading brings the whole history along. The only
+reset is abandoning the session, which is the replay journal the design rejected.
+
+Ordinary runs are unaffected: 1,000 turns is a 44 KB snapshot that loads in
+0.3 ms. The concern starts in the tens of thousands.
+
+## I. Host objects across a dump — `host-objects-across-dump/`
+
+The handoff says the host-side class-instance store is not part of a dump, so
+restored host objects become dead proxies, and concludes: *keep host objects out
+of long-lived guest state.* The premise is right and **the conclusion is too
+strong.**
+
+Five processes, sharing only a 680-byte dump. With an empty store on the far
+side, eager attributes (`ledger.owner`) and the class name still answer from the
+dump, while a method call raises `NameError` and a lazy attribute raises
+`AttributeError` — **both catchable in guest code**, so a stranded handle
+degrades a turn rather than killing a session. Crucially the suspension still
+arrives carrying the correct instance id: the guest-side handle is intact, and
+only the host's half of the mapping is missing.
+
+**So the host can put it back.** A fresh process built an entirely different
+`Ledger` — different balance and limit, by code that never saw the original —
+registered it under the same instance id, loaded the same bytes, and the guest's
+`ledger` worked completely, including the *new* object's limit being enforced.
+Run again with another object and the same bytes answer differently. This is
+experiment B's result for external functions, restated for objects: the snapshot
+records identity, never implementation, and resolution happens at call time —
+keyed by `MontyUuid` rather than by name.
+
+A store holding the right kind of object under the *wrong* id fails exactly like
+an empty store rather than answering from the wrong object. The id is the
+contract, and a mismatch is loud.
+
+One implementer trap: answering an unresolvable handle with
+`ExtFunctionResult::NotFound` produces `NameError: name 'balance' is not
+defined`, which points at the method and reads like a missing function. Return
+`Error(MontyException::new(...))` naming the stranded handle instead.
+
 ---
 
 ## Consequences for the design
@@ -154,10 +259,20 @@ must fire first.
    Cloudflare's CPU limit; use memory and recursion limits for the guest.
 4. **Snapshot cadence sets the blast radius** of a guest OOM, since recovery means
    discarding the instance and reloading the last snapshot.
-5. **Version routing is cheaper than feared.** Shared dump formats across crate
-   versions mean fewer forced retirements; ~4 MiB per linked interpreter means
-   14–16 fit in a bundle.
+5. **Version routing is cheaper than feared, but not free.** Shared dump formats
+   across crate versions mean fewer forced retirements. Budget ~6 MiB per linked
+   1.0-era interpreter, so roughly 10 per bundle — and expect each new Monty to
+   impose its MSRV on every version linked beside it.
 6. **`MemoryError` is not catchable by guest code** — the host must handle it.
+7. **Budget snapshot size against turn count, not state size** (~48 B/turn). At
+   1 GB per object the wall is ~21 million turns, so storage is not the
+   constraint; cold-wake latency and per-hibernation write volume are. A turn
+   budget per run now has a cost curve attached rather than a cliff.
+8. **Host objects may be held in long-lived guest state** provided the host
+   persists the instance-id→object mapping beside the snapshot — for a Durable
+   Object, a row in its own SQLite. Ids must be stable, never regenerated on
+   wake. Put anything that must survive a cold wake unattended into the eager
+   attrs, where it lands in the dump.
 
 ## Still open
 
@@ -166,9 +281,9 @@ must fire first.
   credentials, so everything is local workerd.
 - **The frozen-timer caveat is deduced, not measured** against real Workers.
 - **No real model in the loop** (C) — no API credentials.
-- **`u16` name-id exhaustion after ~65k feeds** (monty #895) was not tested; a
-  long-lived run will eventually hit it.
-- **Host class-instance store is not part of a dump** — the handoff's warning
-  about keeping host objects out of long-lived guest state was not exercised.
 - **JSPI on Workers** remains unverified, though the step-machine design avoids
   needing it.
+- **The 1.0 line is not wasm-measured.** D's ~6 MiB figure is native; E found
+  native and wasm within 5% for 0.0.23, but that was not rechecked for 1.0.
+- **Nothing above 1.0.0-beta.2 exists yet**, so a second genuine format bump —
+  and whether `min_supported` keeps climbing — is unobserved.

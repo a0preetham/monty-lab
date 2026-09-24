@@ -1,0 +1,17 @@
+[package]
+name = "host-objects-across-dump"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Experiment I: do host class instances in guest state survive a dump, and can the host rebind them?"
+
+# Deliberately NOT a workspace member.
+[workspace]
+
+[dependencies]
+monty = "=0.0.23"
+monty-types = "=0.0.23"
+
+[lints.rust]
+unsafe_code = "forbid"

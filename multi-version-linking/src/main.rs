@@ -1,4 +1,4 @@
-//! Experiment D — two Monty versions linked into one binary, dispatched by
+//! Experiment D — several Monty versions linked into one binary, dispatched by
 //! reading the dump header.
 //!
 //! The premise from the handoff: a deploy that bumps the interpreter makes every
@@ -6,14 +6,21 @@
 //! there is no drain window. The fix is to keep old interpreters linked in and
 //! route each snapshot to the version that can read it.
 //!
-//! Cargo makes this easier than expected here: every Monty release is `0.0.x`,
-//! and Cargo treats each `0.0.x` patch as its own semver-incompatible range, so
-//! `monty_v22` and `monty_v23` coexist as wholly separate crates — separate
-//! types, separate statics, distinct symbols. The compiler refuses to mix them,
-//! which is exactly the safety property wanted.
+//! Cargo makes this easier than expected here: every Monty 0.0.x release is its
+//! own semver-incompatible range, and 1.0.0-beta.2 is incompatible with those in
+//! turn, so `monty_v22`, `monty_v23` and `monty_v1` coexist as wholly separate
+//! crates — separate types, separate statics, distinct symbols. The compiler
+//! refuses to mix them, which is exactly the safety property wanted.
+//!
+//! 1.0.0-beta.2 is what makes this experiment complete: it carries dump format
+//! **12** where the 0.0.x pair both carry **8**, so the cross-format route is
+//! exercised for real rather than synthesised by rewriting a header.
 
 use std::process::ExitCode;
 
+use monty_types_v1::{
+    CompileOptions as CompileOptionsV1, PrintWriter as PrintWriterV1, ResourceTracker as ResourceTrackerV1,
+};
 use monty_types_v22::{
     CompileOptions as CompileOptions22, PrintWriter as PrintWriter22, ResourceTracker as ResourceTracker22,
 };
@@ -27,21 +34,24 @@ const HEADER_LEN: usize = 8;
 
 /// A live session, on whichever interpreter version owns it.
 ///
-/// These two variants hold *different types that happen to share a name*. The
-/// whole point is that they cannot be confused: `monty_v22::MontyRepl` and
-/// `monty_v23::MontyRepl` are unrelated to the compiler.
+/// These variants hold *different types that happen to share a name*. The whole
+/// point is that they cannot be confused: `monty_v22::MontyRepl`,
+/// `monty_v23::MontyRepl` and `monty_v1::MontyRepl` are unrelated to the
+/// compiler.
 enum VersionedSession {
     V22(monty_v22::MontyRepl),
     V23(monty_v23::MontyRepl),
+    V1(monty_v1::MontyRepl),
 }
 
 impl VersionedSession {
-    /// Start a new run on the newest interpreter.
+    /// Start a new run on the newest interpreter. New runs always land here;
+    /// older versions exist only to carry runs that already started on them.
     fn new_latest() -> Self {
-        Self::V23(monty_v23::MontyRepl::new(
+        Self::V1(monty_v1::MontyRepl::new(
             SCRIPT,
-            ResourceTracker23::default(),
-            CompileOptions23::default(),
+            ResourceTrackerV1::default(),
+            CompileOptionsV1::default(),
         ))
     }
 
@@ -53,16 +63,31 @@ impl VersionedSession {
         ))
     }
 
+    fn new_v23() -> Self {
+        Self::V23(monty_v23::MontyRepl::new(
+            SCRIPT,
+            ResourceTracker23::default(),
+            CompileOptions23::default(),
+        ))
+    }
+
     fn feed(&mut self, code: &str) -> Result<String, String> {
+        fn tail(e: impl ToString) -> String {
+            e.to_string().lines().next_back().unwrap_or_default().trim().to_owned()
+        }
         match self {
             Self::V22(r) => r
                 .feed_run(code, vec![], PrintWriter22::Disabled)
                 .map(|v| format!("{v:?}"))
-                .map_err(|e| e.to_string().lines().next_back().unwrap_or_default().trim().to_owned()),
+                .map_err(tail),
             Self::V23(r) => r
                 .feed_run(code, vec![], PrintWriter23::Disabled)
                 .map(|v| format!("{v:?}"))
-                .map_err(|e| e.to_string().lines().next_back().unwrap_or_default().trim().to_owned()),
+                .map_err(tail),
+            Self::V1(r) => r
+                .feed_run(code, vec![], PrintWriterV1::Disabled)
+                .map(|v| format!("{v:?}"))
+                .map_err(tail),
         }
     }
 
@@ -70,6 +95,7 @@ impl VersionedSession {
         match self {
             Self::V22(r) => monty_v22::dump(SCRIPT, None, monty_v22::SessionRef::Idle(r)).expect("dump v22"),
             Self::V23(r) => monty_v23::dump(SCRIPT, None, monty_v23::SessionRef::Idle(r)).expect("dump v23"),
+            Self::V1(r) => monty_v1::dump(SCRIPT, None, monty_v1::SessionRef::Idle(r)).expect("dump v1"),
         }
     }
 
@@ -77,6 +103,7 @@ impl VersionedSession {
         match self {
             Self::V22(_) => "monty 0.0.22",
             Self::V23(_) => "monty 0.0.23",
+            Self::V1(_) => "monty 1.0.0-beta.2",
         }
     }
 }
@@ -95,12 +122,19 @@ fn sniff_dump_version(bytes: &[u8]) -> Result<u16, String> {
 
 /// Route a snapshot to whichever linked interpreter claims its dump version.
 ///
-/// Note this is a *dump*-version table, not a crate-version table: two crate
-/// versions may share a dump format. The mapping is maintained by hand, which
-/// is the maintenance cost the handoff flagged.
+/// Note this is a *dump*-version table, not a crate-version table: 0.0.22 and
+/// 0.0.23 share format 8, so one arm serves both. The mapping is maintained by
+/// hand, which is the maintenance cost the handoff flagged.
 fn load_any(bytes: &[u8]) -> Result<VersionedSession, String> {
     let found = sniff_dump_version(bytes)?;
-    if found == monty_v23::DUMP_VERSION {
+    if found == monty_v1::DUMP_VERSION {
+        let d = monty_v1::Dump::load(bytes).map_err(|e| format!("{e:?}"))?;
+        match d.state {
+            monty_v1::Session::Idle(r) => Ok(VersionedSession::V1(*r)),
+            _ => Err("not an idle session".to_owned()),
+        }
+    } else if found == monty_v23::DUMP_VERSION {
+        // Newest interpreter that still reads format 8 wins: 0.0.23, not 0.0.22.
         let d = monty_v23::Dump::load(bytes).map_err(|e| format!("{e:?}"))?;
         match d.state {
             monty_v23::Session::Idle(r) => Ok(VersionedSession::V23(*r)),
@@ -113,54 +147,102 @@ fn load_any(bytes: &[u8]) -> Result<VersionedSession, String> {
             _ => Err("not an idle session".to_owned()),
         }
     } else {
+        // Deduplicated on purpose: the table is keyed by dump version, and two of
+        // the three linked crates answer to the same one.
+        let mut carried = vec![monty_v22::DUMP_VERSION, monty_v23::DUMP_VERSION, monty_v1::DUMP_VERSION];
+        carried.sort_unstable();
+        carried.dedup();
+        let carried: Vec<String> = carried.iter().map(|v| format!("v{v}")).collect();
         Err(format!(
-            "dump v{found} has no linked interpreter (this build carries v{} and v{})",
-            monty_v22::DUMP_VERSION,
-            monty_v23::DUMP_VERSION
+            "dump v{found} has no linked interpreter (this build reads {})",
+            carried.join(", ")
         ))
     }
+}
+
+/// Build some realistic parked-run state: a helper, a class, a live instance.
+fn seed(s: &mut VersionedSession, run_id: &str) {
+    s.feed(&format!("run_id = {run_id:?}")).unwrap();
+    s.feed("def tally(xs):\n    return sum(xs)\n").unwrap();
+    s.feed("class Budget:\n    def __init__(self, t):\n        self.t = t\n    def __repr__(self):\n        return f'Budget({self.t})'\n").unwrap();
+    s.feed("budget = Budget(500)").unwrap();
 }
 
 fn main() -> ExitCode {
     let mut ok = true;
 
     println!("== linked interpreters ==");
-    println!("  monty 0.0.22 -> DUMP_VERSION {}", monty_v22::DUMP_VERSION);
-    println!("  monty 0.0.23 -> DUMP_VERSION {}", monty_v23::DUMP_VERSION);
+    println!("  monty 0.0.22       -> DUMP_VERSION {}", monty_v22::DUMP_VERSION);
+    println!("  monty 0.0.23       -> DUMP_VERSION {}", monty_v23::DUMP_VERSION);
+    println!("  monty 1.0.0-beta.2 -> DUMP_VERSION {}", monty_v1::DUMP_VERSION);
+    println!("  the constants are separate statics: same path spelling, different crates.");
+    println!("  0.0.22 and 0.0.23 share a format; 1.0.0-beta.2 does not — two formats, three versions.");
+
+    println!("\n== runs parked on each version ==");
+    let mut old = VersionedSession::new_v22();
+    seed(&mut old, "parked_on_approval");
+    let old_bytes = old.dump();
     println!(
-        "  the two constants are separate statics: same path spelling, different crates{}",
-        if monty_v22::DUMP_VERSION == monty_v23::DUMP_VERSION {
-            " (and here they happen to carry the same value)"
-        } else {
-            ""
-        }
+        "  {:<18} dumped {} bytes, header v{}",
+        old.version_name(),
+        old_bytes.len(),
+        sniff_dump_version(&old_bytes).unwrap()
     );
 
-    println!("\n== a run that started on 0.0.22 ==");
-    let mut old = VersionedSession::new_v22();
-    old.feed("run_id = 'parked_on_approval'").unwrap();
-    old.feed("def tally(xs):\n    return sum(xs)\n").unwrap();
-    old.feed("class Budget:\n    def __init__(self, t):\n        self.t = t\n    def __repr__(self):\n        return f'Budget({self.t})'\n").unwrap();
-    old.feed("budget = Budget(500)").unwrap();
-    let old_bytes = old.dump();
-    println!("  built on {}, dumped {} bytes, header v{}", old.version_name(), old_bytes.len(), sniff_dump_version(&old_bytes).unwrap());
+    let mut mid = VersionedSession::new_v23();
+    seed(&mut mid, "parked_last_month");
+    let mid_bytes = mid.dump();
+    println!(
+        "  {:<18} dumped {} bytes, header v{}",
+        mid.version_name(),
+        mid_bytes.len(),
+        sniff_dump_version(&mid_bytes).unwrap()
+    );
 
-    println!("\n== a run that started on 0.0.23 ==");
     let mut new = VersionedSession::new_latest();
-    new.feed("run_id = 'started_today'").unwrap();
-    new.feed("def tally(xs):\n    return sum(xs)\n").unwrap();
+    seed(&mut new, "started_today");
     let new_bytes = new.dump();
-    println!("  built on {}, dumped {} bytes, header v{}", new.version_name(), new_bytes.len(), sniff_dump_version(&new_bytes).unwrap());
+    println!(
+        "  {:<18} dumped {} bytes, header v{}",
+        new.version_name(),
+        new_bytes.len(),
+        sniff_dump_version(&new_bytes).unwrap()
+    );
+
+    println!("\n== the cross-format refusal, for real ==");
+    println!("  Not a rewritten header this time: format 8 and format 12 are both");
+    println!("  genuinely published, so each interpreter can be handed the other's bytes.");
+    match monty_v1::Dump::load(&mid_bytes) {
+        Ok(_) => {
+            println!("  FAIL: the 1.0 interpreter accepted a format-8 dump");
+            ok = false;
+        }
+        Err(e) => println!("  1.0.0-beta.2 reading a v8 dump  -> refused: {e:?}"),
+    }
+    match monty_v23::Dump::load(&new_bytes) {
+        Ok(_) => {
+            println!("  FAIL: the 0.0.23 interpreter accepted a format-12 dump");
+            ok = false;
+        }
+        Err(e) => println!("  0.0.23 reading a v12 dump       -> refused: {e:?}"),
+    }
+    println!("  This is the failure the whole design exists to avoid: without the");
+    println!("  router, a deploy that moved 0.0.23 -> 1.0 would meet exactly this.");
 
     println!("\n== dispatch: the host reads 8 bytes and picks an interpreter ==");
-    for (label, bytes) in [("0.0.22 snapshot", &old_bytes), ("0.0.23 snapshot", &new_bytes)] {
+    for (label, bytes) in [
+        ("0.0.22 snapshot", &old_bytes),
+        ("0.0.23 snapshot", &mid_bytes),
+        ("1.0 snapshot", &new_bytes),
+    ] {
         match load_any(bytes) {
             Ok(mut s) => {
                 let who = s.version_name();
                 let a = s.feed("run_id");
                 let b = s.feed("tally([1, 2, 3, 4])");
-                println!("  {label:<16} -> routed to {who:<13} run_id={a:?} tally={b:?}");
-                if a.is_err() || b.is_err() {
+                let c = s.feed("repr(budget)");
+                println!("  {label:<16} -> routed to {who:<18} run_id={a:?} tally={b:?} budget={c:?}");
+                if a.is_err() || b.is_err() || c.is_err() {
                     ok = false;
                 }
             }
@@ -170,6 +252,8 @@ fn main() -> ExitCode {
             }
         }
     }
+    println!("  Each run resumed on the version that wrote it, and kept going — a");
+    println!("  format-8 run still works after the 1.0 interpreter is in the build.");
 
     println!("\n== a snapshot from a version this build does NOT carry ==");
     let mut orphan = new_bytes.clone();
@@ -201,7 +285,8 @@ fn main() -> ExitCode {
 ///
 /// Uncommenting the body fails to compile with a type mismatch: `monty_v22`'s
 /// `MontyRepl`/`SessionRef` and `monty_v23`'s are unrelated types, so a snapshot
-/// cannot be handed to the wrong interpreter by accident.
+/// cannot be handed to the wrong interpreter by accident. The same holds for
+/// `monty_v1`.
 ///
 /// ```compile_fail
 /// let r = monty_v22::MontyRepl::new("x.py", Default::default(), Default::default());

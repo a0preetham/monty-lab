@@ -1,0 +1,24 @@
+[package]
+name = "name-id-exhaustion"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "Experiment H: monty #895 — every feed interns a script name into a u16 space"
+
+# Deliberately NOT a workspace member.
+[workspace]
+
+# Both lines linked, so the same probe runs against each and the answer to
+# "is #895 still live on 1.0?" is a diff rather than two separate runs.
+[dependencies]
+monty_v23 = { package = "monty", version = "=0.0.23" }
+monty_types_v23 = { package = "monty-types", version = "=0.0.23" }
+monty_v1 = { package = "monty", version = "=1.0.0-beta.2" }
+monty_types_v1 = { package = "monty-types", version = "=1.0.0-beta.2" }
+
+[profile.release]
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -2,7 +2,7 @@
 name = "multi-version-linking"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 publish = false
 description = "Experiment D: two monty versions in one binary, dispatched by dump header"
 
@@ -16,6 +16,11 @@ monty_v22 = { package = "monty", version = "=0.0.22" }
 monty_v23 = { package = "monty", version = "=0.0.23" }
 monty_types_v22 = { package = "monty-types", version = "=0.0.22" }
 monty_types_v23 = { package = "monty-types", version = "=0.0.23" }
+# 1.0.0-beta.2 is the first release with a different dump format (12, not 8),
+# so it is what makes a genuine cross-format route testable. It also raises the
+# MSRV to 1.96 — which every co-linked version must then satisfy.
+monty_v1 = { package = "monty", version = "=1.0.0-beta.2" }
+monty_types_v1 = { package = "monty-types", version = "=1.0.0-beta.2" }
 
 [[bin]]
 name = "dispatcher"
@@ -24,6 +29,18 @@ path = "src/main.rs"
 [[bin]]
 name = "only_v23"
 path = "src/bin/only_v23.rs"
+
+[[bin]]
+name = "only_v1"
+path = "src/bin/only_v1.rs"
+
+[[bin]]
+name = "pair_v23_v1"
+path = "src/bin/pair_v23_v1.rs"
+
+[[bin]]
+name = "trio"
+path = "src/bin/trio.rs"
 
 [profile.release]
 strip = true
