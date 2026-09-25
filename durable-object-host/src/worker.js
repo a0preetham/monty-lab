@@ -11,6 +11,7 @@
 // Cloudflare does not snapshot object memory — hibernation discards it — so the
 // snapshot written to storage is the only thing that survives.
 
+import { DEMO_HTML } from './demo.js';
 import initWasm, { AgentSession } from '../wasm/pkg/monty_session.js';
 // Workers resolves a .wasm import to a WebAssembly.Module (compiled at deploy
 // time, not per request). wasm-bindgen's `web` target init accepts one, so no
@@ -104,7 +105,7 @@ export class AgentRun {
       return this.session;
     }
     const tRead = Date.now();
-    const rows = [...this.sql.exec('SELECT bytes, dump_version FROM snapshot WHERE id = 1')];
+    const rows = [...this.sql.exec('SELECT bytes, dump_version, turns FROM snapshot WHERE id = 1')];
     this.timings.sqlReadMs = Date.now() - tRead;
     if (rows.length) {
       const stored = rows[0].dump_version;
@@ -118,6 +119,9 @@ export class AgentRun {
       this.session = AgentSession.restore(new Uint8Array(rows[0].bytes), undefined);
       this.timings.restoreMs = Date.now() - tLoad;
       this.timings.snapshotBytes = rows[0].bytes.byteLength ?? rows[0].bytes.length;
+      // The count lives in the snapshot row, so carry it across a cold wake --
+      // otherwise a resumed run reports turn 1 and looks like a new session.
+      this.turnCount = rows[0].turns ?? 0;
       this.loadedFrom = 'snapshot';
       this.log('woke from snapshot');
     } else {
@@ -383,14 +387,47 @@ function json(body, status = 200) {
 // session that crossed a worker boundary every turn would undo the warm path.
 // ---------------------------------------------------------------------------
 
+/// Where a bot check belongs, if one is added.
+///
+/// Returns a `Response` to reject, or `null` to allow. Nothing is enforced yet:
+/// the demo is an unauthenticated code-execution endpoint, so a public deploy
+/// wants either a Turnstile check here or a rate-limit binding in front of it.
+/// Deliberately left as one function rather than guessed at, so whatever check
+/// gets chosen has exactly one place to go and only the mutating actions pay
+/// for it.
+async function verifyHuman(request, env, action) {
+  const MUTATING = new Set(['turn', 'resume', 'schedule']);
+  if (!MUTATING.has(action)) return null;
+  if (!env.TURNSTILE_SECRET) return null;   // unset => open, as today
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const parts = url.pathname.split('/').filter(Boolean);   // /run/:runId/:action
+
+    // The demo UI. Static, no build step; see `demo.js`.
+    if (parts.length === 0 || (parts.length === 1 && parts[0] === 'index.html')) {
+      return new Response(DEMO_HTML, {
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          // The page is inline, so this is a tight policy: no external anything.
+          'content-security-policy':
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+          'referrer-policy': 'no-referrer',
+          'x-content-type-options': 'nosniff',
+        },
+      });
+    }
+
     if (parts[0] !== 'run' || parts.length < 3) {
       return json({ error: 'expected /run/:runId/:action' }, 400);
     }
     const runId = parts[1];
+
+    const rejected = await verifyHuman(request, env, parts[2]);
+    if (rejected) return rejected;
     // The name IS the address: no allocation, no lookup.
     const id = env.AGENT_RUN.idFromName(runId);
     return env.AGENT_RUN.get(id).fetch(request);

@@ -95,6 +95,44 @@ that throw is exactly where a multi-version build (experiment D) would dispatch 
 the interpreter that can read those bytes.
 
 
+
+## The demo UI
+
+`GET /` serves a single self-contained page (`src/demo.js`) — no build step, no
+dependencies. Enter a session ID and some Python; submitting runs it as a turn in
+that session. An empty session ID mints a new `crypto.randomUUID()` and puts it
+in the URL hash, so the session is bookmarkable and can be pasted back later.
+
+It shows the things that make this runtime interesting rather than just the
+result: a `loaded from` badge distinguishing **new** / **memory** (warm) /
+**snapshot** (cold wake), the turn count, the live snapshot size in bytes, the
+tool calls the turn made, and the object's event log. Calling `await_approval(x)`
+parks the run and the page offers a resume box — you can close the tab and come
+back to it, which is the durable-execution case as a thing you can click.
+
+**The session ID is effectively a bearer token.** It is the Durable Object's
+name, so whoever holds it can read and continue that session. That is why new
+IDs are full UUIDs rather than anything short or sequential.
+
+Two things this shook out that the test suite did not:
+
+- **`dir()` does not exist in Monty**, so the obvious `"n" in dir()` idiom for
+  "increment if defined" fails with `NameError`. `try: n = n + 1 / except
+  NameError: n = 1` works and is what the example uses.
+- **The turn count was lost on a cold wake.** `evict()` cleared it and
+  `ensureSession()` never read it back, though the snapshot row has always
+  stored it — so a resumed run reported turn 1 and looked new. The count is now
+  restored from the row. No test asserted on `turns`, which is why the suite
+  never caught it; the demo displays it, so it showed up immediately.
+
+### A bot check, if the demo goes public
+
+`verifyHuman(request, env, action)` in `worker.js` is the single insertion point,
+called on the mutating actions (`turn`, `resume`, `schedule`) only. It currently
+returns `null` (allow) and short-circuits when `env.TURNSTILE_SECRET` is unset,
+so a Turnstile verification can be dropped in without touching the router.
+Nothing is enforced today — see [Safety](../README.md#safety-when-deploying).
+
 ## Deployed to real Cloudflare
 
 Deployed 2026-09-24 as `monty-agent-runtime` on the Workers paid plan, and

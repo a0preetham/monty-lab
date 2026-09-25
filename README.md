@@ -152,6 +152,12 @@ whose stripped sizes are the per-interpreter marginal cost. G's
 
 ### F, the Durable Object host
 
+`GET /` serves a **demo UI**: enter a session ID (empty mints a new one) and some
+Python, and it runs as a turn in that session, showing whether the interpreter
+came from memory or from a cold snapshot, the turn count, the snapshot size, and
+a resume box when a run parks. See
+[the demo section](durable-object-host/NOTES.md#the-demo-ui).
+
 Locally, against workerd — no Cloudflare credentials needed:
 
 ```bash
@@ -217,7 +223,9 @@ Collected from all nine; each is written up where it was found.
 ## Safety when deploying
 
 `durable-object-host` has **no authentication**: `POST /run/:runId/turn {code}`
-executes guest Python. Monty's sandbox has no network or filesystem access
+executes guest Python, and the demo UI at `GET /` is a front-end for exactly
+that. `verifyHuman()` in `worker.js` is where a Turnstile check belongs; it is a
+no-op today. Monty's sandbox has no network or filesystem access
 (experiment E — every import is a wasm-bindgen placeholder), so the exposure is
 your Workers CPU/request quota and the objects' SQLite storage rather than data
 egress. Still, a deployed worker is an open compute endpoint: gate it behind a
