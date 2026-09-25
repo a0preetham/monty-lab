@@ -14,3 +14,10 @@ new_sqlite_classes = ["AgentRun"]
 
 [build]
 command = ""
+
+# Turnstile. The *site* key is public by design and belongs in config; the
+# secret is set with `wrangler secret put TURNSTILE_SECRET` and never lives
+# here. With neither set the bot gate is inert, which is how local workerd and
+# the integration suite run.
+[vars]
+TURNSTILE_SITE_KEY = "0x4AAAAAAFDqqdyNqiQaevjA"

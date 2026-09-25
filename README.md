@@ -222,10 +222,22 @@ Collected from all nine; each is written up where it was found.
 
 ## Safety when deploying
 
-`durable-object-host` has **no authentication**: `POST /run/:runId/turn {code}`
-executes guest Python, and the demo UI at `GET /` is a front-end for exactly
-that. `verifyHuman()` in `worker.js` is where a Turnstile check belongs; it is a
-no-op today. Monty's sandbox has no network or filesystem access
+`durable-object-host` executes guest Python at `POST /run/:runId/turn {code}`,
+and the demo UI at `GET /` is a front-end for exactly that. The mutating actions
+are gated by **Turnstile**, verified once per visitor and exchanged for a
+30-minute HMAC-signed cookie; read-only `status` stays open. The gate is inert
+unless `TURNSTILE_SECRET` is set, so local workerd is unaffected. See
+[the bot check](durable-object-host/NOTES.md#the-bot-check).
+
+Monty's sandbox has no network or filesystem access (experiment E), so even past
+the gate the exposure is Workers quota and the objects' SQLite rather than data
+egress. A bot that gets through costs Durable Object *duration* at 128 MB plus
+request count, not only CPU — a rate-limit binding in front of `/run/*` is the
+obvious next layer.
+
+Note the **session ID is effectively a bearer token**: it is the Durable
+Object's name, so whoever holds it can read and continue that session. New IDs
+are full UUIDs for that reason. Monty's sandbox has no network or filesystem access
 (experiment E — every import is a wasm-bindgen placeholder), so the exposure is
 your Workers CPU/request quota and the objects' SQLite storage rather than data
 egress. Still, a deployed worker is an open compute endpoint: gate it behind a

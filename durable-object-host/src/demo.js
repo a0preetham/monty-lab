@@ -19,6 +19,7 @@ export const DEMO_HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Monty durable session demo</title>
+<script>window.__SITE_KEY__ = "__TURNSTILE_SITE_KEY__";</script>
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --line: #272b36; --fg: #e6e8ee;
@@ -116,6 +117,7 @@ export const DEMO_HTML = `<!doctype html>
       <button id="copy">Copy link</button>
     </div>
     <div class="badges" id="badges"></div>
+    <div id="ts" style="margin-top:12px"></div>
   </div>
 
   <div class="panel">
@@ -136,6 +138,8 @@ export const DEMO_HTML = `<!doctype html>
       <button id="refresh">Refresh status</button>
     </div>
   </div>
+
+  <p class="hint" id="gateNote" style="display:none; margin: 0 0 16px"></p>
 
   <div class="panel" id="result" style="display:none"></div>
 
@@ -209,11 +213,93 @@ export const DEMO_HTML = `<!doctype html>
     else { history.replaceState(null, '', location.pathname); }
   }
 
-  function api(id, action, body) {
+  // --- Turnstile -----------------------------------------------------------
+  // Verified once and exchanged for a short-lived cookie, rather than per turn:
+  // re-solving a challenge on every submission would make a REPL unusable.
+
+  var SITE_KEY = window.__SITE_KEY__ || '';
+  var gated = SITE_KEY.length > 0;
+  var widgetId = null;
+  var pendingToken = null;
+  var granted = false;
+  var waiters = [];
+
+  function note(msg) {
+    var box = document.getElementById('gateNote');
+    box.textContent = msg || '';
+    box.style.display = msg ? '' : 'none';
+  }
+
+  function onToken(token) {
+    pendingToken = token;
+    var ws = waiters; waiters = [];
+    ws.forEach(function (w) { w(); });
+  }
+
+  function renderWidget() {
+    if (!gated || !window.turnstile) { return; }
+    widgetId = window.turnstile.render('#ts', {
+      sitekey: SITE_KEY,
+      callback: onToken,
+      'error-callback': function () { note('Bot check failed to load. Reload the page.'); },
+      'expired-callback': function () {
+        pendingToken = null; granted = false;
+        window.turnstile.reset(widgetId);
+      },
+      appearance: 'interaction-only',
+      theme: 'dark'
+    });
+  }
+
+  function ensureGrant() {
+    if (!gated || granted) { return Promise.resolve(); }
+    return new Promise(function (resolve, reject) {
+      function exchange() {
+        var token = pendingToken;
+        pendingToken = null;
+        fetch('/verify', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ token: token })
+        }).then(function (r) { return r.json(); }).then(function (out) {
+          if (!out.ok) { reject(new Error('bot check rejected: ' + (out.errors || []).join(', '))); return; }
+          granted = true;
+          note('');
+          // A token is single-use, so arm a fresh one for when the grant lapses.
+          if (window.turnstile && widgetId !== null) { window.turnstile.reset(widgetId); }
+          resolve();
+        }).catch(reject);
+      }
+      if (pendingToken) { exchange(); return; }
+      note('Completing the bot check...');
+      waiters.push(exchange);
+      if (window.turnstile && widgetId !== null) { window.turnstile.execute(widgetId); }
+      setTimeout(function () {
+        if (!granted) { reject(new Error('bot check timed out - reload and try again')); }
+      }, 30000);
+    });
+  }
+
+  function send(id, action, body) {
     return fetch('/run/' + encodeURIComponent(id) + '/' + action, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body || {})
+    });
+  }
+
+  function api(id, action, body) {
+    var mutating = action === 'turn' || action === 'resume' || action === 'schedule';
+    var start = mutating ? ensureGrant() : Promise.resolve();
+    return start.then(function () {
+      return send(id, action, body);
+    }).then(function (r) {
+      // The grant lapsed mid-session: re-arm and retry exactly once.
+      if (r.status === 401 && mutating && granted) {
+        granted = false;
+        return ensureGrant().then(function () { return send(id, action, body); });
+      }
+      return r;
     }).then(function (r) { return r.json(); });
   }
 
@@ -385,6 +471,14 @@ export const DEMO_HTML = `<!doctype html>
       code.focus();
     });
   });
+
+  if (gated) {
+    var sc = document.createElement('script');
+    sc.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    sc.async = true; sc.defer = true;
+    sc.onload = renderWidget;
+    document.head.appendChild(sc);
+  }
 
   if (location.hash.length > 1) {
     sid.value = decodeURIComponent(location.hash.slice(1));

@@ -125,13 +125,52 @@ Two things this shook out that the test suite did not:
   restored from the row. No test asserted on `turns`, which is why the suite
   never caught it; the demo displays it, so it showed up immediately.
 
-### A bot check, if the demo goes public
+### The bot check
 
-`verifyHuman(request, env, action)` in `worker.js` is the single insertion point,
-called on the mutating actions (`turn`, `resume`, `schedule`) only. It currently
-returns `null` (allow) and short-circuits when `env.TURNSTILE_SECRET` is unset,
-so a Turnstile verification can be dropped in without touching the router.
-Nothing is enforced today — see [Safety](../README.md#safety-when-deploying).
+Turnstile, verified **once per visitor** rather than once per turn — re-solving a
+challenge on every code submission would make a REPL unusable. A successful
+verification is exchanged at `POST /verify` for an HMAC-signed, HttpOnly,
+`SameSite=Strict` cookie good for 30 minutes, and that cookie is what the
+mutating actions (`turn`, `resume`, `schedule`) check. Read-only actions
+(`status`) stay open.
+
+The cookie is `<expiry>.<hmac>` and carries no identity: it attests only that
+somebody got past Turnstile recently. Its HMAC key is
+`SHA-256(TURNSTILE_SECRET + "|grant-v1")`, domain-separated so the value used to
+sign cookies is never the value sent to Cloudflare.
+
+**The whole gate is inert unless `TURNSTILE_SECRET` is set**, which is how local
+workerd runs. For a gated deployment, `LAB_TEST_KEY` is a deliberate bypass: the
+integration suite sends it as `x-lab-test-key` so the 23 checks can run against
+production. Both are `wrangler secret`s; the *site* key is public by design and
+lives in `wrangler.toml` as a var, injected into the page at request time so the
+same bundle works gated or ungated.
+
+```bash
+npx wrangler secret put TURNSTILE_SECRET
+npx wrangler secret put LAB_TEST_KEY
+BASE=https://<worker>.workers.dev LAB_TEST_KEY=<key> node test-client.mjs
+```
+
+Verified against the live deployment: an anonymous turn is 401, a forged cookie
+is 401, an expired-but-well-formed cookie is 401, a junk token to `/verify` is
+403 with `invalid-input-response` from the real siteverify endpoint, `status`
+stays 200, and the suite passes 23/23 with the bypass key.
+
+**Turnstile correctly refuses a headless browser on a datacenter IP**, so the
+success path could not be driven from CI here. It was verified in production
+instead by temporarily swapping in Cloudflare's documented always-passes test
+keys (`1x00000000000000000000AA` / `1x0000000000000000000000000000000AA`),
+confirming token → `/verify` → cookie → two successful turns, then restoring the
+real keys. The always-blocks pair (`2x...`) was used locally to exercise the
+rejection path.
+
+One more cold-start trap, found by the gate rather than the suite: `status`
+called `AgentSession.dumpVersion()` without initialising wasm. That never showed
+up before because the first request to reach a Durable Object was always a turn.
+With the gate on, a 401 short-circuits at the router, so `status` can now be the
+first call into a cold isolate — and it 500'd. It now awaits `ensureWasm()`.
+This is the same trap as `clockNowMs()`, hit a second way.
 
 ## Deployed to real Cloudflare
 

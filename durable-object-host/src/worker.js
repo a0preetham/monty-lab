@@ -357,6 +357,11 @@ export class AgentRun {
           return json(await this.cpuBurn(iterations));
         }
         case 'status': {
+          // `dumpVersion()` is a static on the wasm class, so the module has to
+          // be initialised even though this path never touches a session --
+          // otherwise a cold object 500s, which is exactly what opening a
+          // shared session link does.
+          await this.ensureWasm();
           const rows = [...this.sql.exec('SELECT dump_version, turns, updated_at, length(bytes) AS n FROM snapshot WHERE id = 1')];
           const log = [...this.sql.exec('SELECT at, event FROM log ORDER BY seq')];
           return json({
@@ -387,19 +392,126 @@ function json(body, status = 200) {
 // session that crossed a worker boundary every turn would undo the warm path.
 // ---------------------------------------------------------------------------
 
-/// Where a bot check belongs, if one is added.
+// ---------------------------------------------------------------------------
+// Bot check.
+//
+// Turnstile is verified **once per visitor**, not once per turn: this is a REPL,
+// and re-solving a challenge on every code submission would make it unusable.
+// A successful verification is exchanged for a short-lived HMAC-signed cookie,
+// and that cookie is what the mutating actions actually check.
+//
+// The whole gate is inert unless `TURNSTILE_SECRET` is set, so local workerd
+// and the integration suite keep working untouched.
+// ---------------------------------------------------------------------------
+
+const TURNSTILE_VERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+const GRANT_COOKIE = 'mlab_grant';
+const GRANT_TTL_SECONDS = 1800;   // 30 minutes, then the widget is re-run
+const MUTATING = new Set(['turn', 'resume', 'schedule']);
+
+/// HMAC key for the grant cookie.
 ///
-/// Returns a `Response` to reject, or `null` to allow. Nothing is enforced yet:
-/// the demo is an unauthenticated code-execution endpoint, so a public deploy
-/// wants either a Turnstile check here or a rate-limit binding in front of it.
-/// Deliberately left as one function rather than guessed at, so whatever check
-/// gets chosen has exactly one place to go and only the mutating actions pay
-/// for it.
-async function verifyHuman(request, env, action) {
-  const MUTATING = new Set(['turn', 'resume', 'schedule']);
-  if (!MUTATING.has(action)) return null;
-  if (!env.TURNSTILE_SECRET) return null;   // unset => open, as today
+/// Domain-separated from the Turnstile secret by hashing it with a label, so the
+/// value used to sign cookies is never the value sent to Cloudflare.
+async function grantKey(env) {
+  const raw = new TextEncoder().encode(`${env.TURNSTILE_SECRET}|grant-v1`);
+  const bits = await crypto.subtle.digest('SHA-256', raw);
+  return crypto.subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+function b64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function unb64url(s) {
+  const pad = s.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(pad + '='.repeat((4 - (pad.length % 4)) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+/// `<expiry seconds>.<hmac>` — no identity in it, it only attests "a human got
+/// past Turnstile recently".
+async function issueGrant(env) {
+  const payload = String(Math.floor(Date.now() / 1000) + GRANT_TTL_SECONDS);
+  const key = await grantKey(env);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  return `${payload}.${b64url(new Uint8Array(sig))}`;
+}
+
+async function grantValid(env, value) {
+  if (!value || !value.includes('.')) return false;
+  const [payload, sig] = value.split('.');
+  let ok = false;
+  try {
+    const key = await grantKey(env);
+    ok = await crypto.subtle.verify('HMAC', key, unb64url(sig), new TextEncoder().encode(payload));
+  } catch {
+    return false;   // malformed base64 etc.
+  }
+  if (!ok) return false;
+  const exp = Number(payload);
+  // Date.now() is frozen *within* a request but advances between them, which is
+  // all an expiry check needs.
+  return Number.isFinite(exp) && exp > Math.floor(Date.now() / 1000);
+}
+
+function cookie(request, name) {
+  const raw = request.headers.get('cookie');
+  if (!raw) return null;
+  for (const part of raw.split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return v.join('=');
+  }
   return null;
+}
+
+/// Returns a `Response` to reject, or `null` to allow.
+async function verifyHuman(request, env, action) {
+  if (!MUTATING.has(action)) return null;
+  if (!env.TURNSTILE_SECRET) return null;   // gate not configured => open
+
+  // A deliberate, documented bypass so the integration suite can run against a
+  // gated deployment. Only active when LAB_TEST_KEY is set.
+  if (env.LAB_TEST_KEY && request.headers.get('x-lab-test-key') === env.LAB_TEST_KEY) return null;
+
+  if (await grantValid(env, cookie(request, GRANT_COOKIE))) return null;
+  return json({ error: 'human-check-required' }, 401);
+}
+
+/// Exchange a Turnstile token for a grant cookie.
+async function handleVerify(request, env, url) {
+  if (!env.TURNSTILE_SECRET) return json({ ok: true, gate: 'disabled' });
+
+  let token;
+  try {
+    ({ token } = await request.json());
+  } catch {
+    return json({ ok: false, error: 'expected {"token": "..."}' }, 400);
+  }
+  if (!token) return json({ ok: false, error: 'missing token' }, 400);
+
+  const form = new FormData();
+  form.append('secret', env.TURNSTILE_SECRET);
+  form.append('response', token);
+  const ip = request.headers.get('cf-connecting-ip');
+  if (ip) form.append('remoteip', ip);
+
+  const res = await fetch(TURNSTILE_VERIFY, { method: 'POST', body: form });
+  const out = await res.json();
+  if (!out.success) {
+    return json({ ok: false, errors: out['error-codes'] ?? [] }, 403);
+  }
+
+  // `Secure` only over https, so the same code works against local workerd.
+  const secure = url.protocol === 'https:' ? ' Secure;' : '';
+  return new Response(JSON.stringify({ ok: true, ttl: GRANT_TTL_SECONDS }), {
+    headers: {
+      'content-type': 'application/json',
+      'set-cookie': `${GRANT_COOKIE}=${await issueGrant(env)}; Path=/; Max-Age=${GRANT_TTL_SECONDS};${secure} HttpOnly; SameSite=Strict`,
+    },
+  });
 }
 
 export default {
@@ -409,16 +521,28 @@ export default {
 
     // The demo UI. Static, no build step; see `demo.js`.
     if (parts.length === 0 || (parts.length === 1 && parts[0] === 'index.html')) {
-      return new Response(DEMO_HTML, {
+      const siteKey = env.TURNSTILE_SITE_KEY ?? '';
+      // The site key is public by design; it is injected rather than hardcoded
+      // so the same bundle works gated or ungated.
+      const html = DEMO_HTML.replace('__TURNSTILE_SITE_KEY__', siteKey);
+      // The page is inline, so the policy is tight; Turnstile is the one
+      // external origin, and only when it is actually configured.
+      const ts = siteKey ? ' https://challenges.cloudflare.com' : '';
+      return new Response(html, {
         headers: {
           'content-type': 'text/html; charset=utf-8',
-          // The page is inline, so this is a tight policy: no external anything.
           'content-security-policy':
-            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+            `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'${ts}; ` +
+            `connect-src 'self'${ts}; frame-src${ts || " 'none'"}; img-src data:`,
           'referrer-policy': 'no-referrer',
           'x-content-type-options': 'nosniff',
         },
       });
+    }
+
+    // Exchange a Turnstile token for the grant cookie.
+    if (parts.length === 1 && parts[0] === 'verify') {
+      return handleVerify(request, env, url);
     }
 
     if (parts[0] !== 'run' || parts.length < 3) {

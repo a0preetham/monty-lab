@@ -1,13 +1,21 @@
 // Experiment F — exercises the Durable Object host end to end against local
 // workerd. Start the server first: `npx wrangler dev --local --port 8799`.
 const BASE = process.env.BASE ?? 'http://localhost:8799';
+// When the Turnstile gate is configured, mutating actions need either a grant
+// cookie or this bypass header. Set LAB_TEST_KEY to the deployed secret to run
+// the suite against a gated deployment; without it the suite only works where
+// the gate is off.
+const TEST_KEY = process.env.LAB_TEST_KEY ?? '';
 
 let pass = 0, fail = 0;
 
 async function call(runId, action, body) {
   const res = await fetch(`${BASE}/run/${runId}/${action}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(TEST_KEY ? { 'x-lab-test-key': TEST_KEY } : {}),
+    },
     body: JSON.stringify(body ?? {}),
   });
   const json = await res.json();
